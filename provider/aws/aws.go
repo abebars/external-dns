@@ -473,7 +473,7 @@ func (p *AWSProvider) records(ctx context.Context, zones map[string]*route53.Hos
 // Identify if old and new endpoints require DELETE/CREATE instead of UPDATE.
 func (p *AWSProvider) requiresDeleteCreate(old *endpoint.Endpoint, new *endpoint.Endpoint) bool {
 	// a change of record type
-	if old.RecordType != new.RecordType {
+	if new.RecordType != old.RecordType || (isAlias(old) != isAlias(new)) {
 		return true
 	}
 
@@ -516,10 +516,11 @@ func (p *AWSProvider) createUpdateChanges(newEndpoints, oldEndpoints []*endpoint
 		if p.requiresDeleteCreate(old, new) {
 			deletes = append(deletes, old)
 			creates = append(creates, new)
-		} else {
-			// Safe to perform an UPSERT.
-			updates = append(updates, new)
+			continue
 		}
+
+		// Safe to perform an UPSERT.
+		updates = append(updates, new)
 	}
 
 	combined := make(Route53Changes, 0, len(deletes)+len(creates)+len(updates))
@@ -686,6 +687,7 @@ func (p *AWSProvider) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoi
 		alias := false
 
 		if aliasString, ok := ep.GetProviderSpecificProperty(providerSpecificAlias); ok {
+<<<<<<< HEAD
 			alias = aliasString == "true"
 			if alias {
 				if ep.RecordType != endpoint.RecordTypeA && ep.RecordType != endpoint.RecordTypeCNAME {
@@ -704,6 +706,16 @@ func (p *AWSProvider) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoi
 			alias = useAlias(ep, p.preferCNAME)
 			log.Debugf("Modifying endpoint: %v, setting %s=%v", ep, providerSpecificAlias, alias)
 			ep.SetProviderSpecificProperty(providerSpecificAlias, strconv.FormatBool(alias))
+=======
+			alias = aliasString.Value == "true"
+		} else if inferAlias(ep, p.preferCNAME) {
+			alias = true
+			log.Debugf("Modifying endpoint: %v, setting %s=true", ep, providerSpecificAlias)
+			ep.ProviderSpecific = append(ep.ProviderSpecific, endpoint.ProviderSpecificProperty{
+				Name:  providerSpecificAlias,
+				Value: "true",
+			})
+>>>>>>> b256b90a (Minor refactor of AWS ALIAS handling to support transitions to and from)
 		}
 
 		if alias {
@@ -740,7 +752,7 @@ func (p *AWSProvider) newChange(action string, ep *endpoint.Endpoint) (*Route53C
 		},
 	}
 	dualstack := false
-	if targetHostedZone := isAWSAlias(ep); targetHostedZone != "" {
+	if targetHostedZone := aliasHostedZone(ep); targetHostedZone != "" {
 		evalTargetHealth := p.evaluateTargetHealth
 		if prop, ok := ep.GetProviderSpecificProperty(providerSpecificEvaluateTargetHealth); ok {
 			evalTargetHealth = prop == "true"
@@ -1052,8 +1064,8 @@ func suitableZones(hostname string, zones map[string]*route53.HostedZone) []*rou
 	return matchingZones
 }
 
-// useAlias determines if AWS ALIAS should be used.
-func useAlias(ep *endpoint.Endpoint, preferCNAME bool) bool {
+// inferAlias determines if the provider specific alias should be set
+func inferAlias(ep *endpoint.Endpoint, preferCNAME bool) bool {
 	if preferCNAME {
 		return false
 	}
@@ -1065,27 +1077,32 @@ func useAlias(ep *endpoint.Endpoint, preferCNAME bool) bool {
 	return false
 }
 
-// isAWSAlias determines if a given endpoint is supposed to create an AWS Alias record
-// and (if so) returns the target hosted zone ID
-func isAWSAlias(ep *endpoint.Endpoint) string {
-	isAlias, exists := ep.GetProviderSpecificProperty(providerSpecificAlias)
-	if exists && isAlias == "true" && ep.RecordType == endpoint.RecordTypeA && len(ep.Targets) > 0 {
-		// alias records can only point to canonical hosted zones (e.g. to ELBs) or other records in the same zone
-
-		if hostedZoneID, ok := ep.GetProviderSpecificProperty(providerSpecificTargetHostedZone); ok {
-			// existing Endpoint where we got the target hosted zone from the Route53 data
-			return hostedZoneID
-		}
-
-		// check if the target is in a canonical hosted zone
-		if canonicalHostedZone := canonicalHostedZone(ep.Targets[0]); canonicalHostedZone != "" {
-			return canonicalHostedZone
-		}
-
-		// if not, target needs to be in the same zone
-		return sameZoneAlias
+// aliasHostedZone returns the target hosted zone ID for an ALIAS record or the empty string if not an ALIAS
+func aliasHostedZone(ep *endpoint.Endpoint) string {
+	if !isAlias(ep) {
+		return ""
 	}
-	return ""
+	// alias records can only point to canonical hosted zones (e.g. to ELBs) or other records in the same zone
+
+	if hostedZoneID, ok := ep.GetProviderSpecificProperty(providerSpecificTargetHostedZone); ok {
+		// existing Endpoint where we got the target hosted zone from the Route53 data
+		return hostedZoneID.Value
+	}
+
+	// check if the target is in a canonical hosted zone
+	if canonicalHostedZone := canonicalHostedZone(ep.Targets[0]); canonicalHostedZone != "" {
+		return canonicalHostedZone
+	}
+
+	// if not, target needs to be in the same zone
+	return sameZoneAlias
+}
+
+// isAlias tests whether an endpoint is an ALIS. Note this does not do ALIAS inference here (see inferAlias), which is
+// unnecessary after AWSProvider.AdjustEndpoints.
+func isAlias(ep *endpoint.Endpoint) bool {
+	prop, _ := ep.GetProviderSpecificProperty(providerSpecificAlias)
+	return ep.RecordType == endpoint.RecordTypeCNAME && prop.Value == "true" && len(ep.Targets) > 0
 }
 
 // canonicalHostedZone returns the matching canonical zone for a given hostname.
